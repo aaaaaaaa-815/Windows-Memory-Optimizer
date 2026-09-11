@@ -1,8 +1,10 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -23,20 +25,32 @@ namespace MemoryOptimizer
         All = 0b1111111
     }
 
+    /// <summary>
+    /// 配置模型实体
+    /// </summary>
+    public class AppConfig
+    {
+        public bool SilentModeEnabled { get; set; } = false;
+        public bool AutoTimerEnabled { get; set; } = false;
+        public int TimerIntervalMinutes { get; set; } = 30;
+        public bool AutoThresholdEnabled { get; set; } = false;
+        public double ThresholdPercent { get; set; } = 80.0;
+    }
+
     internal static class Program
     {
         private static NotifyIcon? _notifyIcon;
         private static ContextMenuStrip? _trayMenu;
         private static System.Windows.Forms.Timer? _uiUpdateTimer;
 
-        // 自动清理与静默配置参数
-        private static bool _silentModeEnabled = false; // 是否开启静默模式（禁用通知气泡）
+        // 当前应用配置实例
+        private static AppConfig _config = new AppConfig();
 
-        private static bool _autoTimerEnabled = false;
-        private static int _timerIntervalMinutes = 30;
-
-        private static bool _autoThresholdEnabled = false;
-        private static double _thresholdPercent = 80.0;
+        // 配置文件路径：用户文件夹根目录下的 .memory_optimizer.json
+        private static readonly string ConfigFilePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), 
+            ".memory_optimizer.json"
+        );
 
         private static DateTime _lastTimerCleanTime = DateTime.MinValue;
         private static string _lastCleanLog = "无";
@@ -70,10 +84,13 @@ namespace MemoryOptimizer
             // 2. 启用系统提权 (SeProfileSingleProcessPrivilege / SeIncreaseQuotaPrivilege)
             AcquirePrivileges();
 
-            // 3. 构建托盘 UI
+            // 3. 立刻读取配置（若文件不存在，则在此时同步生成并保存为隐藏文件）
+            LoadOrCreateConfigImmediately();
+
+            // 4. 构建托盘 UI (此时已能完美加载最新配置)
             InitializeTrayApp();
 
-            // 4. 启动后台监控线程
+            // 5. 启动后台监控线程
             Thread monitorThread = new Thread(BackgroundMonitorWorker)
             {
                 IsBackground = true,
@@ -81,9 +98,78 @@ namespace MemoryOptimizer
             };
             monitorThread.Start();
 
-            // 5. 进入 Windows 消息循环
+            // 6. 进入 Windows 消息循环
             Application.Run();
         }
+
+        #region 立刻同步读取与写入配置 (用户根目录 + 隐藏属性)
+
+        /// <summary>
+        /// 程序开启时立刻同步读取配置，若不存在则立刻创建并生成隐藏文件
+        /// </summary>
+        private static void LoadOrCreateConfigImmediately()
+        {
+            try
+            {
+                if (File.Exists(ConfigFilePath))
+                {
+                    string json = File.ReadAllText(ConfigFilePath);
+                    var loadedConfig = JsonSerializer.Deserialize<AppConfig>(json);
+                    if (loadedConfig != null)
+                    {
+                        _config = loadedConfig;
+                        return;
+                    }
+                }
+            }
+            catch
+            {
+                // 解析失败时强制重新生成默认配置
+            }
+
+            // 文件不存在或解析失败：立即在开启时生成默认配置文件
+            _config = new AppConfig();
+            SaveConfig();
+        }
+
+        private static void SaveConfig()
+        {
+            try
+            {
+                // 1. 确保目标目录存在
+                string? directory = Path.GetDirectoryName(ConfigFilePath);
+                if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                // 2. 若文件已存在且已被设为隐藏，需先解除隐藏属性，否则 WriteAllText 会抛出拒绝访问异常
+                if (File.Exists(ConfigFilePath))
+                {
+                    FileAttributes currentAttributes = File.GetAttributes(ConfigFilePath);
+                    if ((currentAttributes & FileAttributes.Hidden) == FileAttributes.Hidden)
+                    {
+                        File.SetAttributes(ConfigFilePath, currentAttributes & ~FileAttributes.Hidden);
+                    }
+                }
+
+                // 3. 序列化配置内容
+                var options = new JsonSerializerOptions { WriteIndented = true };
+                string json = JsonSerializer.Serialize(_config, options);
+
+                // 4. 立刻写入配置文件
+                File.WriteAllText(ConfigFilePath, json);
+
+                // 5. 将配置文件设置为系统隐藏文件
+                File.SetAttributes(ConfigFilePath, File.GetAttributes(ConfigFilePath) | FileAttributes.Hidden);
+            }
+            catch (Exception ex)
+            {
+                _lastCleanLog = $"保存配置失败: {ex.Message}";
+            }
+        }
+
+        #endregion
 
         #region 管理员权限校验
 
@@ -155,7 +241,10 @@ namespace MemoryOptimizer
             menuThresholdGroup.DropDownItems.Add(_itemThresholdToggle);
             menuThresholdGroup.DropDownItems.Add(itemSetThreshold);
 
-            // 6. 退出程序
+            // 6. 打开配置文件存储目录
+            var itemOpenConfigFolder = new ToolStripMenuItem("📁 打开配置保存路径", null, (s, e) => OpenConfigFolder());
+
+            // 7. 退出程序
             var itemExit = new ToolStripMenuItem("❌ 退出程序", null, (s, e) => ExitApplication());
 
             // 组合右键菜单
@@ -163,11 +252,12 @@ namespace MemoryOptimizer
             _trayMenu.Items.Add(_itemLastLog);
             _trayMenu.Items.Add(new ToolStripSeparator());
             _trayMenu.Items.Add(itemCleanNow);
-            _trayMenu.Items.Add(_itemSilentToggle); // 静默模式
+            _trayMenu.Items.Add(_itemSilentToggle);
             _trayMenu.Items.Add(new ToolStripSeparator());
             _trayMenu.Items.Add(menuTimerGroup);
             _trayMenu.Items.Add(menuThresholdGroup);
             _trayMenu.Items.Add(new ToolStripSeparator());
+            _trayMenu.Items.Add(itemOpenConfigFolder);
             _trayMenu.Items.Add(itemExit);
 
             // 创建托盘图标
@@ -186,26 +276,20 @@ namespace MemoryOptimizer
             _uiUpdateTimer.Tick += (s, e) => UpdateTrayUI();
             _uiUpdateTimer.Start();
 
-            // 立即刷新一次
+            // 立即刷新一次 UI 状态
             UpdateTrayUI();
-
-            ShowNotification("内存优化工具已启动", "已缩放到系统托盘静默运行，双击图标可直接清理内存。", 3000);
+            // 启动通知：传入 forceShow: true，确保即使开启了静默模式，启动时依然弹窗
+	    ShowNotification("内存优化工具已启动", "已缩放到系统托盘静默运行，双击图标可直接清理内存。", 3000, ToolTipIcon.Info, forceShow: true);
         }
 
-        /// <summary>
-        /// 安全弹窗通知控制器（静默模式开启时自动过滤）
-        /// </summary>
-        private static void ShowNotification(string title, string text, int timeout = 2000, ToolTipIcon icon = ToolTipIcon.Info)
+        private static void ShowNotification(string title, string text, int timeout = 2000, ToolTipIcon icon = ToolTipIcon.Info, bool forceShow = false)
         {
-            if (!_silentModeEnabled && _notifyIcon != null)
+            if ((forceShow || !_config.SilentModeEnabled) && _notifyIcon != null)
             {
                 _notifyIcon.ShowBalloonTip(timeout, title, text, icon);
             }
         }
 
-        /// <summary>
-        /// 刷新托盘图标（动态绘制条状图）和菜单状态
-        /// </summary>
         private static void UpdateTrayUI()
         {
             if (_notifyIcon == null) return;
@@ -225,7 +309,7 @@ namespace MemoryOptimizer
 
             // 2. 更新悬浮提示
             string statusStr = isCleaning ? "正在深度清理中..." : $"内存占用: {usedPercent:F1}%";
-            string silentStr = _silentModeEnabled ? " [静默]" : "";
+            string silentStr = _config.SilentModeEnabled ? " [静默]" : "";
             _notifyIcon.Text = $"内存深度优化工具 (x64){silentStr}\n{statusStr}";
 
             // 3. 更新右键菜单项
@@ -242,25 +326,22 @@ namespace MemoryOptimizer
 
             if (_itemSilentToggle != null)
             {
-                _itemSilentToggle.Checked = _silentModeEnabled;
+                _itemSilentToggle.Checked = _config.SilentModeEnabled;
             }
 
             if (_itemTimerToggle != null)
             {
-                _itemTimerToggle.Text = _autoTimerEnabled ? $"定时清理: 已开启 ({_timerIntervalMinutes}分钟)" : "定时清理: 已关闭";
-                _itemTimerToggle.Checked = _autoTimerEnabled;
+                _itemTimerToggle.Text = _config.AutoTimerEnabled ? $"定时清理: 已开启 ({_config.TimerIntervalMinutes}分钟)" : "定时清理: 已关闭";
+                _itemTimerToggle.Checked = _config.AutoTimerEnabled;
             }
 
             if (_itemThresholdToggle != null)
             {
-                _itemThresholdToggle.Text = _autoThresholdEnabled ? $"阈值清理: 已开启 (>={_thresholdPercent:F0}%)" : "阈值清理: 已关闭";
-                _itemThresholdToggle.Checked = _autoThresholdEnabled;
+                _itemThresholdToggle.Text = _config.AutoThresholdEnabled ? $"阈值清理: 已开启 (>={_config.ThresholdPercent:F0}%)" : "阈值清理: 已关闭";
+                _itemThresholdToggle.Checked = _config.AutoThresholdEnabled;
             }
         }
 
-        /// <summary>
-        /// 动态绘制包含柱状条形图的 16x16 托盘 Icon
-        /// </summary>
         private static Icon CreateMemoryBarIcon(int percent, bool isCleaning)
         {
             percent = Math.Clamp(percent, 0, 100);
@@ -295,6 +376,23 @@ namespace MemoryOptimizer
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern bool DestroyIcon(IntPtr handle);
 
+        private static void OpenConfigFolder()
+        {
+            try
+            {
+                string userProfilePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = userProfilePath,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"无法打开用户文件夹: {ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
         private static void ExitApplication()
         {
             _uiUpdateTimer?.Stop();
@@ -304,11 +402,10 @@ namespace MemoryOptimizer
 
         #endregion
 
-        #region 异步清理触发器 (彻底解耦 UI，无卡顿)
+        #region 异步清理触发器
 
         private static void TriggerAsyncClean(string triggerSource)
         {
-            // 使用 CAS 原子操作防并发/防连续点击
             if (Interlocked.CompareExchange(ref _isCleaningState, 1, 0) != 0)
             {
                 return;
@@ -328,7 +425,6 @@ namespace MemoryOptimizer
                     string freedStr = freedMemory > 0 ? FormatBytes((ulong)freedMemory) : "0 B";
                     _lastCleanLog = $"[{DateTime.Now:HH:mm:ss}] {triggerSource} -> 释放 {freedStr}";
 
-                    // 通过封装方法弹窗，若勾选静默模式则不会弹出提示
                     ShowNotification("内存清理完成", $"触发源: {triggerSource}\n本次成功释放: {freedStr}");
                 }
                 catch (Exception ex)
@@ -337,7 +433,6 @@ namespace MemoryOptimizer
                 }
                 finally
                 {
-                    // 恢复清理状态标记
                     Interlocked.Exchange(ref _isCleaningState, 0);
                 }
             });
@@ -345,46 +440,51 @@ namespace MemoryOptimizer
 
         #endregion
 
-        #region 交互配置逻辑
+        #region 交互配置逻辑 (修改后立刻保存)
 
         private static void ToggleSilentMode(object? sender, EventArgs e)
         {
-            _silentModeEnabled = !_silentModeEnabled;
+            _config.SilentModeEnabled = !_config.SilentModeEnabled;
+            SaveConfig();
             UpdateTrayUI();
         }
 
         private static void ToggleTimerClean(object? sender, EventArgs e)
         {
-            _autoTimerEnabled = !_autoTimerEnabled;
-            if (_autoTimerEnabled) _lastTimerCleanTime = DateTime.Now;
+            _config.AutoTimerEnabled = !_config.AutoTimerEnabled;
+            if (_config.AutoTimerEnabled) _lastTimerCleanTime = DateTime.Now;
+            SaveConfig();
             UpdateTrayUI();
         }
 
         private static void SetTimerInterval(object? sender, EventArgs e)
         {
-            string input = Microsoft.VisualBasic.Interaction.InputBox("请输入定时清理的时间间隔（分钟）:", "设置定时清理间隔", _timerIntervalMinutes.ToString());
+            string input = Microsoft.VisualBasic.Interaction.InputBox("请输入定时清理的时间间隔（分钟）:", "设置定时清理间隔", _config.TimerIntervalMinutes.ToString());
             if (int.TryParse(input, out int min) && min > 0)
             {
-                _timerIntervalMinutes = min;
-                _autoTimerEnabled = true;
+                _config.TimerIntervalMinutes = min;
+                _config.AutoTimerEnabled = true;
                 _lastTimerCleanTime = DateTime.Now;
+                SaveConfig();
                 UpdateTrayUI();
             }
         }
 
         private static void ToggleThresholdClean(object? sender, EventArgs e)
         {
-            _autoThresholdEnabled = !_autoThresholdEnabled;
+            _config.AutoThresholdEnabled = !_config.AutoThresholdEnabled;
+            SaveConfig();
             UpdateTrayUI();
         }
 
         private static void SetThresholdPercent(object? sender, EventArgs e)
         {
-            string input = Microsoft.VisualBasic.Interaction.InputBox("请输入触发自动清理的内存占比百分比阈值 (10 - 99):", "设置占比阈值", _thresholdPercent.ToString("F0"));
+            string input = Microsoft.VisualBasic.Interaction.InputBox("请输入触发自动清理的内存占比百分比阈值 (10 - 99):", "设置占比阈值", _config.ThresholdPercent.ToString("F0"));
             if (double.TryParse(input, out double pct) && pct >= 10 && pct <= 99)
             {
-                _thresholdPercent = pct;
-                _autoThresholdEnabled = true;
+                _config.ThresholdPercent = pct;
+                _config.AutoThresholdEnabled = true;
+                SaveConfig();
                 UpdateTrayUI();
             }
         }
@@ -408,17 +508,17 @@ namespace MemoryOptimizer
                     bool shouldCleanByTimer = false;
                     bool shouldCleanByThreshold = false;
 
-                    if (_autoTimerEnabled)
+                    if (_config.AutoTimerEnabled)
                     {
-                        if ((DateTime.Now - _lastTimerCleanTime).TotalMinutes >= _timerIntervalMinutes)
+                        if ((DateTime.Now - _lastTimerCleanTime).TotalMinutes >= _config.TimerIntervalMinutes)
                         {
                             shouldCleanByTimer = true;
                         }
                     }
 
-                    if (_autoThresholdEnabled)
+                    if (_config.AutoThresholdEnabled)
                     {
-                        if (usedPercent >= _thresholdPercent)
+                        if (usedPercent >= _config.ThresholdPercent)
                         {
                             shouldCleanByThreshold = true;
                         }
@@ -446,7 +546,7 @@ namespace MemoryOptimizer
 
         #endregion
 
-        #region 核心内存深度清理 (全套 Native API)
+        #region 核心内存深度清理 (Native API)
 
         private static void ExecuteMemorySwap(MemSwapScope scope = MemSwapScope.All)
         {
