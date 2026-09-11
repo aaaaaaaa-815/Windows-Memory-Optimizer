@@ -41,6 +41,5 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 
 ## 表达感谢 (Acknowledgements)
 
-特别感谢 **[PCLCE (Plain Craft Launcher CE)](https://github.com/Hex-337/PCLCE)** 项目及开源社区！
-
+特别感谢 **[PCLCE (Plain Craft Launcher CE)](https://github.com/PCL-Community/PCL-CE)** 项目及开源社区！
 本工具在内存管理优化逻辑与 Windows Native API 的高稳定性调优思路上，参考并借鉴了 PCLCE 在极致性能与内存控制方面的优秀实践。感谢开源社区为开发者们提供的卓越灵感与宝贵经验！
